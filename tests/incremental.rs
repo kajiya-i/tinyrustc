@@ -3,11 +3,11 @@
 
 use tinyrustc::db::{Db, Event, FileId};
 
-/// Three whitespace-separated tokens.
-const THREE: &str = "a b c";
-
 /// Four whitespace-separated tokens.
 const FOUR: &str = "a b c d";
+
+/// Five whitespace-separated tokens.
+const FIVE: &str = "a b c d e";
 
 fn executed(name: &str) -> Event {
     Event::Executed(name.to_string())
@@ -21,9 +21,9 @@ fn reused(name: &str) -> Event {
 fn first_call_executes() {
     let mut db = Db::new();
     let f = FileId(0);
-    db.set_source_text(f, THREE.to_string());
+    db.set_source_text(f, FOUR.to_string());
 
-    assert_eq!(db.token_count(f), 3);
+    assert_eq!(db.token_count(f), 4);
     assert_eq!(db.take_events(), vec![executed("token_count(0)")]);
 }
 
@@ -31,13 +31,13 @@ fn first_call_executes() {
 fn second_call_reuses_memo() {
     let mut db = Db::new();
     let f = FileId(0);
-    db.set_source_text(f, THREE.to_string());
+    db.set_source_text(f, FOUR.to_string());
 
     db.token_count(f);
     db.take_events();
 
     // Nothing was written, so the memo must still be valid.
-    assert_eq!(db.token_count(f), 3);
+    assert_eq!(db.token_count(f), 4);
     assert_eq!(db.take_events(), vec![reused("token_count(0)")]);
 }
 
@@ -45,14 +45,14 @@ fn second_call_reuses_memo() {
 fn input_change_forces_reexecution() {
     let mut db = Db::new();
     let f = FileId(0);
-    db.set_source_text(f, THREE.to_string());
+    db.set_source_text(f, FOUR.to_string());
 
     db.token_count(f);
     db.take_events();
 
-    db.set_source_text(f, FOUR.to_string());
+    db.set_source_text(f, FIVE.to_string());
 
-    assert_eq!(db.token_count(f), 4);
+    assert_eq!(db.token_count(f), 5);
     assert_eq!(db.take_events(), vec![executed("token_count(0)")]);
 }
 
@@ -63,8 +63,8 @@ fn unrelated_input_is_not_a_dependency() {
     let mut db = Db::new();
     let f0 = FileId(0);
     let f1 = FileId(1);
-    db.set_source_text(f0, THREE.to_string());
-    db.set_source_text(f1, THREE.to_string());
+    db.set_source_text(f0, FOUR.to_string());
+    db.set_source_text(f1, FIVE.to_string());
 
     db.token_count(f0);
     db.take_events();
@@ -72,7 +72,7 @@ fn unrelated_input_is_not_a_dependency() {
     // token_count(f0) never read f1, so writing f1 must not disturb it.
     db.set_source_text(f1, FOUR.to_string());
 
-    assert_eq!(db.token_count(f0), 3);
+    assert_eq!(db.token_count(f0), 4);
     assert_eq!(db.take_events(), vec![reused("token_count(0)")]);
 }
 
@@ -87,13 +87,13 @@ fn unrelated_input_is_not_a_dependency() {
 fn identical_rewrite_still_invalidates() {
     let mut db = Db::new();
     let f = FileId(0);
-    db.set_source_text(f, THREE.to_string());
+    db.set_source_text(f, FOUR.to_string());
 
     db.token_count(f);
     db.take_events();
 
     // Same bytes as before.
-    db.set_source_text(f, THREE.to_string());
+    db.set_source_text(f, FOUR.to_string());
 
     db.token_count(f);
     assert_eq!(db.take_events(), vec![executed("token_count(0)")]);
