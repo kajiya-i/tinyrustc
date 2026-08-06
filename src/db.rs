@@ -72,6 +72,8 @@ pub struct FileId(pub u32);
 enum DepKey {
     SourceText(FileId),
     TokenCount(FileId),
+    IsTrivial(FileId),
+    Weight(FileId),
 }
 
 impl fmt::Display for DepKey {
@@ -79,6 +81,8 @@ impl fmt::Display for DepKey {
         match *self {
             DepKey::SourceText(file) => write!(f, "source_text({})", file.0),
             DepKey::TokenCount(file) => write!(f, "token_count({})", file.0),
+            DepKey::IsTrivial(file) => write!(f, "is_trivial({})", file.0),
+            DepKey::Weight(file) => write!(f, "weight({})", file.0),
         }
     }
 }
@@ -129,6 +133,8 @@ pub struct Db {
 
     // Memo tables, one per derived query.
     token_count_memos: HashMap<FileId, Memo<usize>>,
+    is_trivial_memos: HashMap<FileId, Memo<bool>>,
+    weight_memos: HashMap<FileId, Memo<usize>>,
 
     stack: Vec<QueryFrame>,
     events: Vec<Event>,
@@ -141,6 +147,8 @@ impl Db {
             source_texts: HashMap::new(),
             source_text_changed_at: HashMap::new(),
             token_count_memos: HashMap::new(),
+            is_trivial_memos: HashMap::new(),
+            weight_memos: HashMap::new(),
             stack: Vec::new(),
             events: Vec::new(),
         }
@@ -247,6 +255,20 @@ impl Db {
                     .expect("memo absent after its query ran")
                     .changed_at
             }
+            DepKey::IsTrivial(file) => {
+                self.is_trivial(file);
+                self.is_trivial_memos
+                    .get(&file)
+                    .expect("memo absent after its query ran")
+                    .changed_at
+            }
+            DepKey::Weight(file) => {
+                self.weight(file);
+                self.weight_memos
+                    .get(&file)
+                    .expect("memo absent after its query ran")
+                    .changed_at
+            }
         }
     }
 
@@ -298,6 +320,103 @@ impl Db {
 
     fn token_count_impl(&mut self, file: FileId) -> usize {
         self.source_text(file).split_whitespace().count()
+    }
+
+    /// Whether `file` holds fewer than three tokens.
+    ///
+    /// Derived from another derived query rather than from an input, which is
+    /// what makes validation recursive.
+    pub fn is_trivial(&mut self, file: FileId) -> bool {
+        let key = DepKey::IsTrivial(file);
+        self.record_dep(key);
+
+        if let Some(memo) = self.is_trivial_memos.remove(&file) {
+            let fresh = memo.verified_at == self.current
+                || self.deps_unchanged(&memo.deps, memo.verified_at);
+            if fresh {
+                let value = memo.value;
+                let verified_at = self.current;
+                self.is_trivial_memos.insert(
+                    file,
+                    Memo {
+                        verified_at,
+                        ..memo
+                    },
+                );
+                self.events.push(Event::Reused(key.to_string()));
+                return value;
+            }
+        }
+
+        self.events.push(Event::Executed(key.to_string()));
+        let revision = self.current;
+        self.push_frame(key);
+        let value = self.is_trivial_impl(file);
+        let deps = self.pop_frame();
+        self.is_trivial_memos.insert(
+            file,
+            Memo {
+                value,
+                changed_at: revision,
+                verified_at: revision,
+                deps,
+            },
+        );
+        value
+    }
+
+    fn is_trivial_impl(&mut self, file: FileId) -> bool {
+        self.token_count(file) < 3
+    }
+
+    /// The token count of `file`, or zero if the file is trivial.
+    ///
+    /// Reads two derived queries, one of which reads the other, so its
+    /// dependency graph is a diamond.
+    pub fn weight(&mut self, file: FileId) -> usize {
+        let key = DepKey::Weight(file);
+        self.record_dep(key);
+
+        if let Some(memo) = self.weight_memos.remove(&file) {
+            let fresh = memo.verified_at == self.current
+                || self.deps_unchanged(&memo.deps, memo.verified_at);
+            if fresh {
+                let value = memo.value;
+                let verified_at = self.current;
+                self.weight_memos.insert(
+                    file,
+                    Memo {
+                        verified_at,
+                        ..memo
+                    },
+                );
+                self.events.push(Event::Reused(key.to_string()));
+                return value;
+            }
+        }
+
+        self.events.push(Event::Executed(key.to_string()));
+        let revision = self.current;
+        self.push_frame(key);
+        let value = self.weight_impl(file);
+        let deps = self.pop_frame();
+        self.weight_memos.insert(
+            file,
+            Memo {
+                value,
+                changed_at: revision,
+                verified_at: revision,
+                deps,
+            },
+        );
+        value
+    }
+
+    fn weight_impl(&mut self, file: FileId) -> usize {
+        // Both reads are unconditional so that the dependency set does not vary
+        // with the input, which would make the tests harder to reason about.
+        let count = self.token_count(file);
+        if self.is_trivial(file) { 0 } else { count }
     }
 
     /// Drains the event log.
