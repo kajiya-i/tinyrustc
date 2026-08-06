@@ -16,6 +16,7 @@
 
 ## Test Plan
 
-- [ ] `zig build` compiles cleanly
-- [ ] `zig build test` passes
-- [ ] `zig fmt --check .` passes
+- [ ] `cargo build` compiles cleanly
+- [ ] `cargo test` passes
+- [ ] `cargo fmt --check` passes
+- [ ] `cargo clippy --all-targets` is clean
