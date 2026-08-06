@@ -14,23 +14,34 @@
 //!
 //! # Dependency tracking
 //!
-//! Every read of an input is funnelled through an accessor that records a
-//! [`DepKey`] into the frame of the query currently executing. Those keys are
-//! stored alongside the memoized value, and a memo is considered valid when
-//! none of its recorded dependencies has changed since the memo was verified.
-//! Reads therefore may not bypass the accessors: touching a field directly
-//! silently drops an edge from the dependency graph and produces stale results.
+//! Every read is funnelled through an accessor that records a [`DepKey`] into
+//! the frame of the query currently executing. Those keys are stored alongside
+//! the memoized value. Reads may not bypass the accessors: touching a field
+//! directly silently drops an edge from the dependency graph and produces stale
+//! results.
+//!
+//! # Validation
+//!
+//! A memo carries two revisions. `changed_at` is when its value last differed;
+//! `verified_at` is when it was last confirmed current. Confirming a memo means
+//! bringing each of its dependencies up to date - which may execute them - and
+//! checking that none reports a change newer than `verified_at`. A memo already
+//! verified in this revision is accepted without walking its dependencies at
+//! all, which is what keeps diamond-shaped graphs from being traversed
+//! exponentially.
 //!
 //! # Current limitations
 //!
-//! - Validity is decided by comparing revisions, never values. Rewriting an
-//!   input with an identical value still invalidates everything derived from
-//!   it. Backdating fixes this.
-//! - Only inputs can be dependencies. Once one derived query calls another,
-//!   [`DepKey`] must grow a variant per query and validation must become
-//!   recursive.
+//! - No backdating. A query that re-runs always reports the current revision as
+//!   its `changed_at`, even when it recomputed the identical value, so its
+//!   dependents re-run too. Comparing the new value against the old one and
+//!   keeping the older `changed_at` when they agree is what fixes this.
+//! - Cycles abort the process rather than producing a diagnostic.
+//! - Every query needs its own memo table and match arm by hand. `salsa`'s
+//!   attribute macros exist to generate exactly this boilerplate.
 
 use std::collections::HashMap;
+use std::fmt;
 
 /// A monotonically increasing logical clock, bumped on every write to an input.
 ///
@@ -56,13 +67,24 @@ impl Revision {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FileId(pub u32);
 
-/// Identifies something a query is allowed to read.
-///
-/// One variant per input kind today; derived queries will need variants of
-/// their own once they can depend on each other.
+/// Identifies something a query is allowed to read: an input or another query.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 enum DepKey {
     SourceText(FileId),
+    TokenCount(FileId),
+    IsTrivial(FileId),
+    Weight(FileId),
+}
+
+impl fmt::Display for DepKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            DepKey::SourceText(file) => write!(f, "source_text({})", file.0),
+            DepKey::TokenCount(file) => write!(f, "token_count({})", file.0),
+            DepKey::IsTrivial(file) => write!(f, "is_trivial({})", file.0),
+            DepKey::Weight(file) => write!(f, "weight({})", file.0),
+        }
+    }
 }
 
 /// A record of how a query call was serviced.
@@ -78,19 +100,23 @@ pub enum Event {
     Reused(String),
 }
 
-/// A memoized query result, the revision at which it was last known good, and
-/// everything it read while being computed.
+/// A memoized query result, the revisions bounding its validity, and everything
+/// it read while being computed.
 struct Memo<V> {
     value: V,
+    changed_at: Revision,
     verified_at: Revision,
     deps: Vec<DepKey>,
 }
 
-/// Accumulates the dependencies of one in-flight query.
+/// Accumulates the reads attributed to one in-flight query.
 ///
 /// Frames form a stack so that a query calling another query does not steal its
 /// callee's reads.
 struct QueryFrame {
+    /// The query being computed, or `None` for a validation frame whose
+    /// recorded reads are discarded.
+    key: Option<DepKey>,
     deps: Vec<DepKey>,
 }
 
@@ -107,6 +133,8 @@ pub struct Db {
 
     // Memo tables, one per derived query.
     token_count_memos: HashMap<FileId, Memo<usize>>,
+    is_trivial_memos: HashMap<FileId, Memo<bool>>,
+    weight_memos: HashMap<FileId, Memo<usize>>,
 
     stack: Vec<QueryFrame>,
     events: Vec<Event>,
@@ -119,6 +147,8 @@ impl Db {
             source_texts: HashMap::new(),
             source_text_changed_at: HashMap::new(),
             token_count_memos: HashMap::new(),
+            is_trivial_memos: HashMap::new(),
+            weight_memos: HashMap::new(),
             stack: Vec::new(),
             events: Vec::new(),
         }
@@ -160,68 +190,233 @@ impl Db {
         }
     }
 
-    /// Returns the revision at which `dep` last changed.
-    fn changed_at(&self, dep: DepKey) -> Revision {
+    /// Opens a frame for the body of `key`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is already being computed further down the stack. A
+    /// cyclic query graph has no least fixed point to converge on here.
+    fn push_frame(&mut self, key: DepKey) {
+        if self.stack.iter().any(|frame| frame.key == Some(key)) {
+            panic!("query cycle detected while computing {key}");
+        }
+        self.stack.push(QueryFrame {
+            key: Some(key),
+            deps: Vec::new(),
+        });
+    }
+
+    /// Closes the innermost frame and yields what it read.
+    fn pop_frame(&mut self) -> Vec<DepKey> {
+        self.stack.pop().expect("query stack underflow").deps
+    }
+
+    /// Brings each of `deps` up to date and reports whether all of them last
+    /// changed no later than `verified_at`.
+    fn deps_unchanged(&mut self, deps: &[DepKey], verified_at: Revision) -> bool {
+        // Bringing a dependency up to date invokes it, and a query registers
+        // itself with whatever frame is on top. Those registrations belong to
+        // no memo, so they are collected into a frame that is discarded.
+        // Without this, validating one query would attach spurious edges to an
+        // unrelated query that happens to be executing.
+        self.stack.push(QueryFrame {
+            key: None,
+            deps: Vec::new(),
+        });
+
+        let mut unchanged = true;
+        for &dep in deps {
+            if self.changed_at(dep) > verified_at {
+                unchanged = false;
+                break;
+            }
+        }
+
+        self.stack.pop().expect("validation frame vanished");
+        unchanged
+    }
+
+    /// Brings `dep` up to date and returns the revision at which its value last
+    /// changed.
+    ///
+    /// For an input this is a stored fact. For a derived query it is not: the
+    /// query has to be run, or at least revalidated, before the answer exists.
+    fn changed_at(&mut self, dep: DepKey) -> Revision {
         match dep {
             DepKey::SourceText(file) => self
                 .source_text_changed_at
                 .get(&file)
                 .copied()
                 .unwrap_or(Revision::START),
+            DepKey::TokenCount(file) => {
+                self.token_count(file);
+                self.token_count_memos
+                    .get(&file)
+                    .expect("memo absent after its query ran")
+                    .changed_at
+            }
+            DepKey::IsTrivial(file) => {
+                self.is_trivial(file);
+                self.is_trivial_memos
+                    .get(&file)
+                    .expect("memo absent after its query ran")
+                    .changed_at
+            }
+            DepKey::Weight(file) => {
+                self.weight(file);
+                self.weight_memos
+                    .get(&file)
+                    .expect("memo absent after its query ran")
+                    .changed_at
+            }
         }
-    }
-
-    /// Whether every dependency in `deps` predates `verified_at`.
-    ///
-    /// An empty dependency set is trivially unchanged: a query that read
-    /// nothing can never go stale.
-    fn deps_unchanged(&self, deps: &[DepKey], verified_at: Revision) -> bool {
-        deps.iter().all(|&dep| self.changed_at(dep) <= verified_at)
     }
 
     /// Counts whitespace-separated tokens in `file`.
-    ///
-    /// A placeholder computation. What matters is the surrounding pattern:
-    /// consult the memo table, return early if its dependencies still hold,
-    /// otherwise run the body under a fresh frame and store what it read.
     pub fn token_count(&mut self, file: FileId) -> usize {
-        let key = format!("token_count({})", file.0);
+        let key = DepKey::TokenCount(file);
+        self.record_dep(key);
 
-        // FIXME: validity is computed in a separate pass over the memo table so
-        // that the borrow ends before the table is mutated, costing a second
-        // lookup on the hit path.
-        let valid = match self.token_count_memos.get(&file) {
-            Some(memo) => self.deps_unchanged(&memo.deps, memo.verified_at),
-            None => false,
-        };
-
-        if valid {
-            let value = self.token_count_memos[&file].value;
-            self.events.push(Event::Reused(key));
-            return value;
+        // FIXME: the memo is removed and reinserted so that no borrow of the
+        // table is live while dependencies are validated. Interior mutability
+        // would let this be a single lookup.
+        if let Some(memo) = self.token_count_memos.remove(&file) {
+            let fresh = memo.verified_at == self.current
+                || self.deps_unchanged(&memo.deps, memo.verified_at);
+            if fresh {
+                let value = memo.value;
+                let verified_at = self.current;
+                self.token_count_memos.insert(
+                    file,
+                    Memo {
+                        verified_at,
+                        ..memo
+                    },
+                );
+                self.events.push(Event::Reused(key.to_string()));
+                return value;
+            }
+            // Stale: the memo is dropped and the body re-runs below.
         }
 
-        self.events.push(Event::Executed(key));
-        self.stack.push(QueryFrame { deps: Vec::new() });
+        self.events.push(Event::Executed(key.to_string()));
+        // Captured before the body runs, so the memo can never claim to have
+        // been verified against a revision later than the one it observed.
+        let revision = self.current;
+        self.push_frame(key);
         let value = self.token_count_impl(file);
-        let frame = self.stack.pop().expect("query stack underflow");
-
-        let verified_at = self.current;
+        let deps = self.pop_frame();
         self.token_count_memos.insert(
             file,
             Memo {
                 value,
-                verified_at,
-                deps: frame.deps,
+                changed_at: revision,
+                verified_at: revision,
+                deps,
             },
         );
         value
     }
 
-    /// The body of [`Db::token_count`], separated so that the memoization
-    /// wrapper stays free of domain logic.
     fn token_count_impl(&mut self, file: FileId) -> usize {
         self.source_text(file).split_whitespace().count()
+    }
+
+    /// Whether `file` holds fewer than three tokens.
+    ///
+    /// Derived from another derived query rather than from an input, which is
+    /// what makes validation recursive.
+    pub fn is_trivial(&mut self, file: FileId) -> bool {
+        let key = DepKey::IsTrivial(file);
+        self.record_dep(key);
+
+        if let Some(memo) = self.is_trivial_memos.remove(&file) {
+            let fresh = memo.verified_at == self.current
+                || self.deps_unchanged(&memo.deps, memo.verified_at);
+            if fresh {
+                let value = memo.value;
+                let verified_at = self.current;
+                self.is_trivial_memos.insert(
+                    file,
+                    Memo {
+                        verified_at,
+                        ..memo
+                    },
+                );
+                self.events.push(Event::Reused(key.to_string()));
+                return value;
+            }
+        }
+
+        self.events.push(Event::Executed(key.to_string()));
+        let revision = self.current;
+        self.push_frame(key);
+        let value = self.is_trivial_impl(file);
+        let deps = self.pop_frame();
+        self.is_trivial_memos.insert(
+            file,
+            Memo {
+                value,
+                changed_at: revision,
+                verified_at: revision,
+                deps,
+            },
+        );
+        value
+    }
+
+    fn is_trivial_impl(&mut self, file: FileId) -> bool {
+        self.token_count(file) < 3
+    }
+
+    /// The token count of `file`, or zero if the file is trivial.
+    ///
+    /// Reads two derived queries, one of which reads the other, so its
+    /// dependency graph is a diamond.
+    pub fn weight(&mut self, file: FileId) -> usize {
+        let key = DepKey::Weight(file);
+        self.record_dep(key);
+
+        if let Some(memo) = self.weight_memos.remove(&file) {
+            let fresh = memo.verified_at == self.current
+                || self.deps_unchanged(&memo.deps, memo.verified_at);
+            if fresh {
+                let value = memo.value;
+                let verified_at = self.current;
+                self.weight_memos.insert(
+                    file,
+                    Memo {
+                        verified_at,
+                        ..memo
+                    },
+                );
+                self.events.push(Event::Reused(key.to_string()));
+                return value;
+            }
+        }
+
+        self.events.push(Event::Executed(key.to_string()));
+        let revision = self.current;
+        self.push_frame(key);
+        let value = self.weight_impl(file);
+        let deps = self.pop_frame();
+        self.weight_memos.insert(
+            file,
+            Memo {
+                value,
+                changed_at: revision,
+                verified_at: revision,
+                deps,
+            },
+        );
+        value
+    }
+
+    fn weight_impl(&mut self, file: FileId) -> usize {
+        // Both reads are unconditional so that the dependency set does not vary
+        // with the input, which would make the tests harder to reason about.
+        let count = self.token_count(file);
+        if self.is_trivial(file) { 0 } else { count }
     }
 
     /// Drains the event log.
