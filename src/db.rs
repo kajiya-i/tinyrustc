@@ -32,10 +32,8 @@
 //!
 //! # Current limitations
 //!
-//! - No backdating. A query that re-runs always reports the current revision as
-//!   its `changed_at`, even when it recomputed the identical value, so its
-//!   dependents re-run too. Comparing the new value against the old one and
-//!   keeping the older `changed_at` when they agree is what fixes this.
+//! - Backdating compares values with `==`, so it only helps for cheaply
+//!   comparable results. Large trees will want a fingerprint instead.
 //! - Cycles abort the process rather than producing a diagnostic.
 //! - Every query needs its own memo table and match arm by hand. `salsa`'s
 //!   attribute macros exist to generate exactly this boilerplate.
@@ -280,24 +278,28 @@ impl Db {
         // FIXME: the memo is removed and reinserted so that no borrow of the
         // table is live while dependencies are validated. Interior mutability
         // would let this be a single lookup.
-        if let Some(memo) = self.token_count_memos.remove(&file) {
-            let fresh = memo.verified_at == self.current
-                || self.deps_unchanged(&memo.deps, memo.verified_at);
-            if fresh {
-                let value = memo.value;
-                let verified_at = self.current;
-                self.token_count_memos.insert(
-                    file,
-                    Memo {
-                        verified_at,
-                        ..memo
-                    },
-                );
-                self.events.push(Event::Reused(key.to_string()));
-                return value;
+        let stale = match self.token_count_memos.remove(&file) {
+            Some(memo) => {
+                let fresh = memo.verified_at == self.current
+                    || self.deps_unchanged(&memo.deps, memo.verified_at);
+                if fresh {
+                    let value = memo.value;
+                    let verified_at = self.current;
+                    self.token_count_memos.insert(
+                        file,
+                        Memo {
+                            verified_at,
+                            ..memo
+                        },
+                    );
+                    self.events.push(Event::Reused(key.to_string()));
+                    return value;
+                }
+                // Retained only so the recomputed value can be compared to it.
+                Some(memo)
             }
-            // Stale: the memo is dropped and the body re-runs below.
-        }
+            None => None,
+        };
 
         self.events.push(Event::Executed(key.to_string()));
         // Captured before the body runs, so the memo can never claim to have
@@ -306,11 +308,21 @@ impl Db {
         self.push_frame(key);
         let value = self.token_count_impl(file);
         let deps = self.pop_frame();
+
+        // Backdating. Recomputing an identical value is not a change, so the
+        // older change revision stands and dependents are left green. Note that
+        // this cannot spare the query itself: discovering that the value is
+        // unchanged requires running the body.
+        let changed_at = match &stale {
+            Some(old) if old.value == value => old.changed_at,
+            _ => revision,
+        };
+
         self.token_count_memos.insert(
             file,
             Memo {
                 value,
-                changed_at: revision,
+                changed_at,
                 verified_at: revision,
                 deps,
             },
@@ -330,34 +342,44 @@ impl Db {
         let key = DepKey::IsTrivial(file);
         self.record_dep(key);
 
-        if let Some(memo) = self.is_trivial_memos.remove(&file) {
-            let fresh = memo.verified_at == self.current
-                || self.deps_unchanged(&memo.deps, memo.verified_at);
-            if fresh {
-                let value = memo.value;
-                let verified_at = self.current;
-                self.is_trivial_memos.insert(
-                    file,
-                    Memo {
-                        verified_at,
-                        ..memo
-                    },
-                );
-                self.events.push(Event::Reused(key.to_string()));
-                return value;
+        let stale = match self.is_trivial_memos.remove(&file) {
+            Some(memo) => {
+                let fresh = memo.verified_at == self.current
+                    || self.deps_unchanged(&memo.deps, memo.verified_at);
+                if fresh {
+                    let value = memo.value;
+                    let verified_at = self.current;
+                    self.is_trivial_memos.insert(
+                        file,
+                        Memo {
+                            verified_at,
+                            ..memo
+                        },
+                    );
+                    self.events.push(Event::Reused(key.to_string()));
+                    return value;
+                }
+                Some(memo)
             }
-        }
+            None => None,
+        };
 
         self.events.push(Event::Executed(key.to_string()));
         let revision = self.current;
         self.push_frame(key);
         let value = self.is_trivial_impl(file);
         let deps = self.pop_frame();
+
+        let changed_at = match &stale {
+            Some(old) if old.value == value => old.changed_at,
+            _ => revision,
+        };
+
         self.is_trivial_memos.insert(
             file,
             Memo {
                 value,
-                changed_at: revision,
+                changed_at,
                 verified_at: revision,
                 deps,
             },
