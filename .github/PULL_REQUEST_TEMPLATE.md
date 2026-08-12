@@ -16,7 +16,9 @@
 
 ## Test Plan
 
-- [ ] `cargo build` compiles cleanly
-- [ ] `cargo test` passes
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --all-targets` is clean
+CI runs all of these; tick them once it is green, or after running them locally.
+
+- [ ] `cargo fmt --all --check`
+- [ ] `cargo clippy --all-targets -- -D warnings`
+- [ ] `cargo test`
+- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`

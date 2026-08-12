@@ -14,7 +14,7 @@
 //!
 //! # Dependency tracking
 //!
-//! Every read is funnelled through an accessor that records a [`DepKey`] into
+//! Every read is funnelled through an accessor that records a `DepKey` into
 //! the frame of the query currently executing. Those keys are stored alongside
 //! the memoized value. Reads may not bypass the accessors: touching a field
 //! directly silently drops an edge from the dependency graph and produces stale
@@ -52,7 +52,7 @@
 //!   larger results will want to be handed back behind an `Rc` or an arena
 //!   reference, as `rustc` does.
 //! - Cycles abort the process rather than producing a diagnostic.
-//! - Every query still needs its own memo table, [`DepKey`] variant, and
+//! - Every query still needs its own memo table, `DepKey` variant, and
 //!   `changed_at` arm by hand. `salsa`'s attribute macros exist to generate
 //!   exactly this boilerplate.
 
