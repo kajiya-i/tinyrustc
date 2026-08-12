@@ -347,7 +347,16 @@ mod tests {
 
     #[test]
     fn slash_alone_is_division() {
-        assert_eq!(kinds("a / b").first(), Some(&RawTokenKind::Ident));
+        assert_eq!(
+            kinds("a / b"),
+            vec![
+                RawTokenKind::Ident,
+                RawTokenKind::Whitespace,
+                RawTokenKind::Slash,
+                RawTokenKind::Whitespace,
+                RawTokenKind::Ident,
+            ],
+        );
         assert_eq!(kinds("/"), vec![RawTokenKind::Slash]);
     }
 
