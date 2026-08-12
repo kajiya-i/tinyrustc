@@ -177,15 +177,13 @@ fn unrelated_file_leaves_the_graph_warm() {
     assert!(executed_queries(&events).is_empty());
 }
 
-/// Pins down a known deficiency: rewriting an input with an identical value
-/// still invalidates memos derived from it.
+/// Backdating cannot spare the query that sits directly on the changed input.
 ///
-/// Validity compares revisions, never values, so a no-op write bumps the
-/// input's change revision and forces recomputation. Backdating - comparing the
-/// recomputed value against the previous one and restoring the older
-/// verification revision when they agree - is what fixes this.
+/// The input's revision moved, and nothing short of running the body can
+/// establish whether the text actually differs, so `token_count` re-executes.
+/// What backdating buys is that the change stops here.
 #[test]
-fn identical_rewrite_still_invalidates() {
+fn identical_rewrite_still_reruns_the_first_query() {
     let mut db = Db::new();
     let f = FileId(0);
     db.set_source_text(f, FOUR.to_string());
@@ -200,16 +198,15 @@ fn identical_rewrite_still_invalidates() {
     assert_eq!(db.take_events(), vec![executed("token_count(0)")]);
 }
 
-/// Pins the deficiency that backdating exists to fix.
+/// Backdating stops a change from propagating; it does not stop a query whose
+/// dependency moved from running.
 ///
-/// Going from four tokens to five genuinely changes `token_count`, but
-/// `is_trivial` is false either way. Because a re-executed query always reports
-/// the current revision as its `changed_at`, `is_trivial` is invalidated even
-/// though its value could not have moved. Comparing the recomputed value
-/// against the previous one, and keeping the older `changed_at` when they
-/// agree, would let it stay green.
+/// Four tokens to five genuinely changes `token_count`, so `is_trivial` has to
+/// run to find out whether its own answer moved. It recomputes `false` and
+/// backdates, but `weight` reads `token_count` directly and re-runs regardless,
+/// which is why the backdating is not observable from here.
 #[test]
-fn dependent_reruns_even_when_the_value_is_unchanged() {
+fn backdating_does_not_spare_the_query_itself() {
     let mut db = Db::new();
     let f = FileId(0);
     db.set_source_text(f, FOUR.to_string());
@@ -223,4 +220,24 @@ fn dependent_reruns_even_when_the_value_is_unchanged() {
 
     let events = db.take_events();
     assert!(executed_queries(&events).contains("is_trivial(0)"));
+}
+
+/// The payoff. A no-op write invalidates `token_count`, which recomputes the same count and backdates, so validation of `is_trivial` and `weight`
+/// succeeds without either body running - two derived levels stay green.
+#[test]
+fn identical_rewrite_stops_at_the_first_query() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, FOUR.to_string());
+
+    db.weight(f);
+    db.take_events();
+
+    // Same bytes as before.
+    db.set_source_text(f, FOUR.to_string());
+
+    assert_eq!(db.weight(f), 4);
+
+    let events = db.take_events();
+    assert_eq!(executed_queries(&events), query_set(["token_count(0)"]));
 }
