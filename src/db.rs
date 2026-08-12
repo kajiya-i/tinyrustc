@@ -20,6 +20,20 @@
 //! directly silently drops an edge from the dependency graph and produces stale
 //! results.
 //!
+//! # Access discipline
+//!
+//! Inputs are written only through `&mut self` setters and read through `&self`,
+//! so they need no interior mutability and an accessor can hand out a borrow of
+//! one. Memo tables, the query stack, and the event log are written by queries
+//! themselves and live behind `RefCell`, which is why every query takes `&self`.
+//! `rustc` draws the same line, with `TyCtxt` a `Copy` handle over caches behind
+//! locks; the locks are sharded because it compiles in parallel, which this does
+//! not.
+//!
+//! A `RefCell` borrow must never be held across a call into another query: the
+//! callee will re-enter the same table and panic. Every borrow below is confined
+//! to a single statement for that reason.
+//!
 //! # Validation
 //!
 //! A memo carries two revisions. `changed_at` is when its value last differed;
@@ -38,6 +52,7 @@
 //! - Every query needs its own memo table and match arm by hand. `salsa`'s
 //!   attribute macros exist to generate exactly this boilerplate.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -120,22 +135,23 @@ struct QueryFrame {
 
 /// Storage for all inputs, memos, and the event log.
 ///
-/// Queries are methods on this type. Reads take `&mut self` because servicing a
-/// query may populate the memo table and record dependencies.
+/// Queries are methods on this type and take `&self`; only writing an input
+/// requires `&mut self`.
 pub struct Db {
     current: Revision,
 
-    // Inputs, paired with the revision at which each was last written.
+    // Inputs, paired with the revision at which each was last written. Written
+    // only by `&mut self` setters, so no interior mutability is needed.
     source_texts: HashMap<FileId, String>,
     source_text_changed_at: HashMap<FileId, Revision>,
 
-    // Memo tables, one per derived query.
-    token_count_memos: HashMap<FileId, Memo<usize>>,
-    is_trivial_memos: HashMap<FileId, Memo<bool>>,
-    weight_memos: HashMap<FileId, Memo<usize>>,
+    // Memo tables, one per derived query. Written by queries.
+    token_count_memos: RefCell<HashMap<FileId, Memo<usize>>>,
+    is_trivial_memos: RefCell<HashMap<FileId, Memo<bool>>>,
+    weight_memos: RefCell<HashMap<FileId, Memo<usize>>>,
 
-    stack: Vec<QueryFrame>,
-    events: Vec<Event>,
+    stack: RefCell<Vec<QueryFrame>>,
+    events: RefCell<Vec<Event>>,
 }
 
 impl Db {
@@ -144,11 +160,11 @@ impl Db {
             current: Revision::START,
             source_texts: HashMap::new(),
             source_text_changed_at: HashMap::new(),
-            token_count_memos: HashMap::new(),
-            is_trivial_memos: HashMap::new(),
-            weight_memos: HashMap::new(),
-            stack: Vec::new(),
-            events: Vec::new(),
+            token_count_memos: RefCell::new(HashMap::new()),
+            is_trivial_memos: RefCell::new(HashMap::new()),
+            weight_memos: RefCell::new(HashMap::new()),
+            stack: RefCell::new(Vec::new()),
+            events: RefCell::new(Vec::new()),
         }
     }
 
@@ -168,7 +184,7 @@ impl Db {
     ///
     /// Panics if `file` has no text set. Reading an unset input is a bug in the
     /// driver, not a recoverable condition.
-    fn source_text(&mut self, file: FileId) -> &str {
+    fn source_text(&self, file: FileId) -> &str {
         self.record_dep(DepKey::SourceText(file));
         self.source_texts
             .get(&file)
@@ -179,8 +195,9 @@ impl Db {
     ///
     /// Reads issued outside a query - by the driver, say - are intentionally
     /// not recorded: they belong to no memo.
-    fn record_dep(&mut self, dep: DepKey) {
-        if let Some(frame) = self.stack.last_mut() {
+    fn record_dep(&self, dep: DepKey) {
+        let mut stack = self.stack.borrow_mut();
+        if let Some(frame) = stack.last_mut() {
             // Dependency sets are small, so a linear scan beats a hash set.
             if !frame.deps.contains(&dep) {
                 frame.deps.push(dep);
@@ -194,30 +211,38 @@ impl Db {
     ///
     /// Panics if `key` is already being computed further down the stack. A
     /// cyclic query graph has no least fixed point to converge on here.
-    fn push_frame(&mut self, key: DepKey) {
-        if self.stack.iter().any(|frame| frame.key == Some(key)) {
+    fn push_frame(&self, key: DepKey) {
+        let mut stack = self.stack.borrow_mut();
+        if stack.iter().any(|frame| frame.key == Some(key)) {
             panic!("query cycle detected while computing {key}");
         }
-        self.stack.push(QueryFrame {
+        stack.push(QueryFrame {
             key: Some(key),
             deps: Vec::new(),
         });
     }
 
     /// Closes the innermost frame and yields what it read.
-    fn pop_frame(&mut self) -> Vec<DepKey> {
-        self.stack.pop().expect("query stack underflow").deps
+    fn pop_frame(&self) -> Vec<DepKey> {
+        self.stack
+            .borrow_mut()
+            .pop()
+            .expect("query stack underflow")
+            .deps
     }
 
     /// Brings each of `deps` up to date and reports whether all of them last
     /// changed no later than `verified_at`.
-    fn deps_unchanged(&mut self, deps: &[DepKey], verified_at: Revision) -> bool {
+    fn deps_unchanged(&self, deps: &[DepKey], verified_at: Revision) -> bool {
         // Bringing a dependency up to date invokes it, and a query registers
         // itself with whatever frame is on top. Those registrations belong to
         // no memo, so they are collected into a frame that is discarded.
         // Without this, validating one query would attach spurious edges to an
         // unrelated query that happens to be executing.
-        self.stack.push(QueryFrame {
+        //
+        // Each borrow stands alone: keeping one alive across `changed_at` would
+        // re-enter the stack and panic.
+        self.stack.borrow_mut().push(QueryFrame {
             key: None,
             deps: Vec::new(),
         });
@@ -230,7 +255,10 @@ impl Db {
             }
         }
 
-        self.stack.pop().expect("validation frame vanished");
+        self.stack
+            .borrow_mut()
+            .pop()
+            .expect("validation frame vanished");
         unchanged
     }
 
@@ -239,7 +267,7 @@ impl Db {
     ///
     /// For an input this is a stored fact. For a derived query it is not: the
     /// query has to be run, or at least revalidated, before the answer exists.
-    fn changed_at(&mut self, dep: DepKey) -> Revision {
+    fn changed_at(&self, dep: DepKey) -> Revision {
         match dep {
             DepKey::SourceText(file) => self
                 .source_text_changed_at
@@ -247,8 +275,10 @@ impl Db {
                 .copied()
                 .unwrap_or(Revision::START),
             DepKey::TokenCount(file) => {
+                // The query runs to completion before the table is borrowed.
                 self.token_count(file);
                 self.token_count_memos
+                    .borrow()
                     .get(&file)
                     .expect("memo absent after its query ran")
                     .changed_at
@@ -256,6 +286,7 @@ impl Db {
             DepKey::IsTrivial(file) => {
                 self.is_trivial(file);
                 self.is_trivial_memos
+                    .borrow()
                     .get(&file)
                     .expect("memo absent after its query ran")
                     .changed_at
@@ -263,6 +294,7 @@ impl Db {
             DepKey::Weight(file) => {
                 self.weight(file);
                 self.weight_memos
+                    .borrow()
                     .get(&file)
                     .expect("memo absent after its query ran")
                     .changed_at
@@ -271,28 +303,32 @@ impl Db {
     }
 
     /// Counts whitespace-separated tokens in `file`.
-    pub fn token_count(&mut self, file: FileId) -> usize {
+    pub fn token_count(&self, file: FileId) -> usize {
         let key = DepKey::TokenCount(file);
         self.record_dep(key);
 
-        // FIXME: the memo is removed and reinserted so that no borrow of the
-        // table is live while dependencies are validated. Interior mutability
-        // would let this be a single lookup.
-        let stale = match self.token_count_memos.remove(&file) {
+        // A statement of its own: as a match scrutinee the `RefMut` would live
+        // until the end of the match, and validating dependencies re-enters this
+        // table.
+        let existing = self.token_count_memos.borrow_mut().remove(&file);
+
+        let stale = match existing {
             Some(memo) => {
                 let fresh = memo.verified_at == self.current
                     || self.deps_unchanged(&memo.deps, memo.verified_at);
                 if fresh {
                     let value = memo.value;
                     let verified_at = self.current;
-                    self.token_count_memos.insert(
+                    self.token_count_memos.borrow_mut().insert(
                         file,
                         Memo {
                             verified_at,
                             ..memo
                         },
                     );
-                    self.events.push(Event::Reused(key.to_string()));
+                    self.events
+                        .borrow_mut()
+                        .push(Event::Reused(key.to_string()));
                     return value;
                 }
                 // Retained only so the recomputed value can be compared to it.
@@ -301,7 +337,9 @@ impl Db {
             None => None,
         };
 
-        self.events.push(Event::Executed(key.to_string()));
+        self.events
+            .borrow_mut()
+            .push(Event::Executed(key.to_string()));
         // Captured before the body runs, so the memo can never claim to have
         // been verified against a revision later than the one it observed.
         let revision = self.current;
@@ -318,7 +356,7 @@ impl Db {
             _ => revision,
         };
 
-        self.token_count_memos.insert(
+        self.token_count_memos.borrow_mut().insert(
             file,
             Memo {
                 value,
@@ -330,7 +368,7 @@ impl Db {
         value
     }
 
-    fn token_count_impl(&mut self, file: FileId) -> usize {
+    fn token_count_impl(&self, file: FileId) -> usize {
         self.source_text(file).split_whitespace().count()
     }
 
@@ -338,25 +376,29 @@ impl Db {
     ///
     /// Derived from another derived query rather than from an input, which is
     /// what makes validation recursive.
-    pub fn is_trivial(&mut self, file: FileId) -> bool {
+    pub fn is_trivial(&self, file: FileId) -> bool {
         let key = DepKey::IsTrivial(file);
         self.record_dep(key);
 
-        let stale = match self.is_trivial_memos.remove(&file) {
+        let existing = self.is_trivial_memos.borrow_mut().remove(&file);
+
+        let stale = match existing {
             Some(memo) => {
                 let fresh = memo.verified_at == self.current
                     || self.deps_unchanged(&memo.deps, memo.verified_at);
                 if fresh {
                     let value = memo.value;
                     let verified_at = self.current;
-                    self.is_trivial_memos.insert(
+                    self.is_trivial_memos.borrow_mut().insert(
                         file,
                         Memo {
                             verified_at,
                             ..memo
                         },
                     );
-                    self.events.push(Event::Reused(key.to_string()));
+                    self.events
+                        .borrow_mut()
+                        .push(Event::Reused(key.to_string()));
                     return value;
                 }
                 Some(memo)
@@ -364,7 +406,9 @@ impl Db {
             None => None,
         };
 
-        self.events.push(Event::Executed(key.to_string()));
+        self.events
+            .borrow_mut()
+            .push(Event::Executed(key.to_string()));
         let revision = self.current;
         self.push_frame(key);
         let value = self.is_trivial_impl(file);
@@ -375,7 +419,7 @@ impl Db {
             _ => revision,
         };
 
-        self.is_trivial_memos.insert(
+        self.is_trivial_memos.borrow_mut().insert(
             file,
             Memo {
                 value,
@@ -387,7 +431,7 @@ impl Db {
         value
     }
 
-    fn is_trivial_impl(&mut self, file: FileId) -> bool {
+    fn is_trivial_impl(&self, file: FileId) -> bool {
         self.token_count(file) < 3
     }
 
@@ -395,34 +439,40 @@ impl Db {
     ///
     /// Reads two derived queries, one of which reads the other, so its
     /// dependency graph is a diamond.
-    pub fn weight(&mut self, file: FileId) -> usize {
+    pub fn weight(&self, file: FileId) -> usize {
         let key = DepKey::Weight(file);
         self.record_dep(key);
 
-        if let Some(memo) = self.weight_memos.remove(&file) {
+        let existing = self.weight_memos.borrow_mut().remove(&file);
+
+        if let Some(memo) = existing {
             let fresh = memo.verified_at == self.current
                 || self.deps_unchanged(&memo.deps, memo.verified_at);
             if fresh {
                 let value = memo.value;
                 let verified_at = self.current;
-                self.weight_memos.insert(
+                self.weight_memos.borrow_mut().insert(
                     file,
                     Memo {
                         verified_at,
                         ..memo
                     },
                 );
-                self.events.push(Event::Reused(key.to_string()));
+                self.events
+                    .borrow_mut()
+                    .push(Event::Reused(key.to_string()));
                 return value;
             }
         }
 
-        self.events.push(Event::Executed(key.to_string()));
+        self.events
+            .borrow_mut()
+            .push(Event::Executed(key.to_string()));
         let revision = self.current;
         self.push_frame(key);
         let value = self.weight_impl(file);
         let deps = self.pop_frame();
-        self.weight_memos.insert(
+        self.weight_memos.borrow_mut().insert(
             file,
             Memo {
                 value,
@@ -434,7 +484,7 @@ impl Db {
         value
     }
 
-    fn weight_impl(&mut self, file: FileId) -> usize {
+    fn weight_impl(&self, file: FileId) -> usize {
         // Both reads are unconditional so that the dependency set does not vary
         // with the input, which would make the tests harder to reason about.
         let count = self.token_count(file);
@@ -442,8 +492,8 @@ impl Db {
     }
 
     /// Drains the event log.
-    pub fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
+    pub fn take_events(&self) -> Vec<Event> {
+        self.events.take()
     }
 }
 
