@@ -48,9 +48,13 @@
 //!
 //! - Backdating compares values with `==`, so it only helps for cheaply
 //!   comparable results. Large trees will want a fingerprint instead.
+//! - Returning a memoized value clones it. Fine for counts and token lists;
+//!   larger results will want to be handed back behind an `Rc` or an arena
+//!   reference, as `rustc` does.
 //! - Cycles abort the process rather than producing a diagnostic.
-//! - Every query needs its own memo table and match arm by hand. `salsa`'s
-//!   attribute macros exist to generate exactly this boilerplate.
+//! - Every query still needs its own memo table, [`DepKey`] variant, and
+//!   `changed_at` arm by hand. `salsa`'s attribute macros exist to generate
+//!   exactly this boilerplate.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -302,30 +306,37 @@ impl Db {
         }
     }
 
-    /// Counts whitespace-separated tokens in `file`.
-    pub fn token_count(&self, file: FileId) -> usize {
-        let key = DepKey::TokenCount(file);
+    /// The body shared by every derived query.
+    ///
+    /// Returns `table`'s memo for `file` if it can be validated, and otherwise
+    /// runs `compute` and memoizes the result. The logic is identical for every
+    /// query - only the table, the key, and the body differ - so writing it out
+    /// per query would be three chances to get validation subtly wrong.
+    ///
+    /// `V: Clone` because the memo outlives the call: the caller gets a copy and
+    /// the table keeps its own. `V: PartialEq` is what backdating compares.
+    fn memoized<V: Clone + PartialEq>(
+        &self,
+        key: DepKey,
+        table: &RefCell<HashMap<FileId, Memo<V>>>,
+        file: FileId,
+        compute: impl FnOnce() -> V,
+    ) -> V {
         self.record_dep(key);
 
         // A statement of its own: as a match scrutinee the `RefMut` would live
         // until the end of the match, and validating dependencies re-enters this
         // table.
-        let existing = self.token_count_memos.borrow_mut().remove(&file);
+        let existing = table.borrow_mut().remove(&file);
 
         let stale = match existing {
-            Some(memo) => {
+            Some(mut memo) => {
                 let fresh = memo.verified_at == self.current
                     || self.deps_unchanged(&memo.deps, memo.verified_at);
                 if fresh {
-                    let value = memo.value;
-                    let verified_at = self.current;
-                    self.token_count_memos.borrow_mut().insert(
-                        file,
-                        Memo {
-                            verified_at,
-                            ..memo
-                        },
-                    );
+                    memo.verified_at = self.current;
+                    let value = memo.value.clone();
+                    table.borrow_mut().insert(file, memo);
                     self.events
                         .borrow_mut()
                         .push(Event::Reused(key.to_string()));
@@ -344,7 +355,7 @@ impl Db {
         // been verified against a revision later than the one it observed.
         let revision = self.current;
         self.push_frame(key);
-        let value = self.token_count_impl(file);
+        let value = compute();
         let deps = self.pop_frame();
 
         // Backdating. Recomputing an identical value is not a change, so the
@@ -356,10 +367,10 @@ impl Db {
             _ => revision,
         };
 
-        self.token_count_memos.borrow_mut().insert(
+        table.borrow_mut().insert(
             file,
             Memo {
-                value,
+                value: value.clone(),
                 changed_at,
                 verified_at: revision,
                 deps,
@@ -368,8 +379,14 @@ impl Db {
         value
     }
 
-    fn token_count_impl(&self, file: FileId) -> usize {
-        self.source_text(file).split_whitespace().count()
+    /// Counts whitespace-separated tokens in `file`.
+    pub fn token_count(&self, file: FileId) -> usize {
+        self.memoized(
+            DepKey::TokenCount(file),
+            &self.token_count_memos,
+            file,
+            || self.source_text(file).split_whitespace().count(),
+        )
     }
 
     /// Whether `file` holds fewer than three tokens.
@@ -377,62 +394,12 @@ impl Db {
     /// Derived from another derived query rather than from an input, which is
     /// what makes validation recursive.
     pub fn is_trivial(&self, file: FileId) -> bool {
-        let key = DepKey::IsTrivial(file);
-        self.record_dep(key);
-
-        let existing = self.is_trivial_memos.borrow_mut().remove(&file);
-
-        let stale = match existing {
-            Some(memo) => {
-                let fresh = memo.verified_at == self.current
-                    || self.deps_unchanged(&memo.deps, memo.verified_at);
-                if fresh {
-                    let value = memo.value;
-                    let verified_at = self.current;
-                    self.is_trivial_memos.borrow_mut().insert(
-                        file,
-                        Memo {
-                            verified_at,
-                            ..memo
-                        },
-                    );
-                    self.events
-                        .borrow_mut()
-                        .push(Event::Reused(key.to_string()));
-                    return value;
-                }
-                Some(memo)
-            }
-            None => None,
-        };
-
-        self.events
-            .borrow_mut()
-            .push(Event::Executed(key.to_string()));
-        let revision = self.current;
-        self.push_frame(key);
-        let value = self.is_trivial_impl(file);
-        let deps = self.pop_frame();
-
-        let changed_at = match &stale {
-            Some(old) if old.value == value => old.changed_at,
-            _ => revision,
-        };
-
-        self.is_trivial_memos.borrow_mut().insert(
+        self.memoized(
+            DepKey::IsTrivial(file),
+            &self.is_trivial_memos,
             file,
-            Memo {
-                value,
-                changed_at,
-                verified_at: revision,
-                deps,
-            },
-        );
-        value
-    }
-
-    fn is_trivial_impl(&self, file: FileId) -> bool {
-        self.token_count(file) < 3
+            || self.token_count(file) < 3,
+        )
     }
 
     /// The token count of `file`, or zero if the file is trivial.
@@ -440,55 +407,13 @@ impl Db {
     /// Reads two derived queries, one of which reads the other, so its
     /// dependency graph is a diamond.
     pub fn weight(&self, file: FileId) -> usize {
-        let key = DepKey::Weight(file);
-        self.record_dep(key);
-
-        let existing = self.weight_memos.borrow_mut().remove(&file);
-
-        if let Some(memo) = existing {
-            let fresh = memo.verified_at == self.current
-                || self.deps_unchanged(&memo.deps, memo.verified_at);
-            if fresh {
-                let value = memo.value;
-                let verified_at = self.current;
-                self.weight_memos.borrow_mut().insert(
-                    file,
-                    Memo {
-                        verified_at,
-                        ..memo
-                    },
-                );
-                self.events
-                    .borrow_mut()
-                    .push(Event::Reused(key.to_string()));
-                return value;
-            }
-        }
-
-        self.events
-            .borrow_mut()
-            .push(Event::Executed(key.to_string()));
-        let revision = self.current;
-        self.push_frame(key);
-        let value = self.weight_impl(file);
-        let deps = self.pop_frame();
-        self.weight_memos.borrow_mut().insert(
-            file,
-            Memo {
-                value,
-                changed_at: revision,
-                verified_at: revision,
-                deps,
-            },
-        );
-        value
-    }
-
-    fn weight_impl(&self, file: FileId) -> usize {
-        // Both reads are unconditional so that the dependency set does not vary
-        // with the input, which would make the tests harder to reason about.
-        let count = self.token_count(file);
-        if self.is_trivial(file) { 0 } else { count }
+        self.memoized(DepKey::Weight(file), &self.weight_memos, file, || {
+            // Both reads are unconditional so that the dependency set does not
+            // vary with the input, which would make the tests harder to reason
+            // about.
+            let count = self.token_count(file);
+            if self.is_trivial(file) { 0 } else { count }
+        })
     }
 
     /// Drains the event log.
