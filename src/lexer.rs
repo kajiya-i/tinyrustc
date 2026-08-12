@@ -52,7 +52,7 @@ pub enum RawTokenKind {
     /// Trivia. Reported rather than skipped so that token lengths tile the input.
     Whitespace,
     LineComment,
-    /// `terminated` is false for a black comment running to end of input. The
+    /// `terminated` is false for a block comment running to end of input. The
     /// token is still produced, because refusing to produce one would break the
     /// tiling invariant and leave the layer above unable to place the error.
     BlockComment {
@@ -224,7 +224,7 @@ impl<'a> Cursor<'a> {
         RawTokenKind::LineComment
     }
 
-    /// Lexes from the `*` to the matching `*/`. honouring nesting as Rust does.
+    /// Lexes from the `*` to the matching `*/`, honouring nesting as Rust does.
     fn block_comment(&mut self) -> RawTokenKind {
         self.bump();
         let mut depth = 1usize;
@@ -251,7 +251,7 @@ impl<'a> Cursor<'a> {
 
     /// Lexes a lifetime, the leading `'` already consumed.
     ///
-    /// A bare `'` is [`RawTokenKind::Unkown`]. This language has no character
+    /// A bare `'` is [`RawTokenKind::Unknown`]. This language has no character
     /// literals, which is what makes the decision this simple; `rustc` has to
     /// look further ahead.
     fn lifetime(&mut self) -> RawTokenKind {
