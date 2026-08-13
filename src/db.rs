@@ -436,7 +436,7 @@ impl Db {
         })
     }
 
-    /// Returns the symbol for `text`, assigning a fresh one of it is new.
+    /// Returns the symbol for `text`, assigning a fresh one if it is new.
     ///
     /// Records no dependency: the interner is not an input. See the module
     /// documentation.
@@ -448,7 +448,8 @@ impl Db {
     ///
     /// # Panics
     ///
-    /// Panics if `symbol` was not issued by this database's interner.
+    /// Panics if `symbol`'s index is out of bounds. See [`Interner::get`] for
+    /// why a symbol issued by another interner is not reliably caught.
     pub fn symbol_text(&self, symbol: Symbol) -> Rc<str> {
         self.interner.borrow().get(symbol)
     }
