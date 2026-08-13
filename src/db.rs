@@ -34,6 +34,19 @@
 //! callee will re-enter the same table and panic. Every borrow below is confined
 //! to a single statement for that reason.
 //!
+//! # What is not a query
+//!
+//! The symbol interner lives here but is deliberately not memoized and records
+//! no dependency edges. It is not an input - nobody writes it - and it grows as
+//! a side effect of being read. Recording `intern` as a dependency would make
+//! adding one unrelated identifier invalidate unrelated memos, and memoizing it
+//! would be pointless because it is idempotent within a session.
+//!
+//! The consequence is that symbol numbers are session-local: they depend on the
+//! order files happen to be read, which demand-driven evaluation does not fix.
+//! That is why a `Symbol` cannot be serialized or ordered, and why `rustc` keeps
+//! a stable `DefPathHash` alongside its session-local `DefId`.
+//!
 //! # Validation
 //!
 //! A memo carries two revisions. `changed_at` is when its value last differed;
@@ -59,6 +72,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
+
+use crate::symbol::{Interner, Symbol};
 
 /// A monotonically increasing logical clock, bumped on every write to an input.
 ///
@@ -154,6 +170,9 @@ pub struct Db {
     is_trivial_memos: RefCell<HashMap<FileId, Memo<bool>>>,
     weight_memos: RefCell<HashMap<FileId, Memo<usize>>>,
 
+    // Outside the query graph; see the module documentation.
+    interner: RefCell<Interner>,
+
     stack: RefCell<Vec<QueryFrame>>,
     events: RefCell<Vec<Event>>,
 }
@@ -167,6 +186,7 @@ impl Db {
             token_count_memos: RefCell::new(HashMap::new()),
             is_trivial_memos: RefCell::new(HashMap::new()),
             weight_memos: RefCell::new(HashMap::new()),
+            interner: RefCell::new(Interner::new()),
             stack: RefCell::new(Vec::new()),
             events: RefCell::new(Vec::new()),
         }
@@ -414,6 +434,24 @@ impl Db {
             let count = self.token_count(file);
             if self.is_trivial(file) { 0 } else { count }
         })
+    }
+
+    /// Returns the symbol for `text`, assigning a fresh one if it is new.
+    ///
+    /// Records no dependency: the interner is not an input. See the module
+    /// documentation.
+    pub fn intern(&self, text: &str) -> Symbol {
+        self.interner.borrow_mut().intern(text)
+    }
+
+    /// The text `symbol` stands for.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `symbol`'s index is out of bounds. See [`Interner::get`] for
+    /// why a symbol issued by another interner is not reliably caught.
+    pub fn symbol_text(&self, symbol: Symbol) -> Rc<str> {
+        self.interner.borrow().get(symbol)
     }
 
     /// Drains the event log.

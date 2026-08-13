@@ -17,6 +17,7 @@
 //! symbol itself.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// An interned string, identified by its position in an [`Interner`].
 ///
@@ -62,11 +63,15 @@ impl Symbol {
 /// The table mapping strings to [`Symbol`]s and back.
 pub struct Interner {
     /// Indexed by `Symbol`, so `strings[symbol.0]` is its text.
-    strings: Vec<String>,
-    /// FIXME: every interned string is stored twice, once here as a key and once
-    /// in `strings`. `rustc` allocates the text in an arena and keeps `&str`
-    /// views of it in both places.
-    lookup: HashMap<String, Symbol>,
+    ///
+    /// `Rc<str>` rather than `String` so that [`Interner::get`] can hand out the
+    /// text without borrowing the interner. That matters because the interner
+    /// lives behind a `RefCell` in the database, and a borrow of a `RefCell`
+    /// cannot outlive the statement that took it.
+    strings: Vec<Rc<str>>,
+    /// The text is shared with `strings` rather than duplicated. `rustc`
+    /// allocates it in an arena instead and keeps `&str` views in both places.
+    lookup: HashMap<Rc<str>, Symbol>,
 }
 
 impl Interner {
@@ -87,21 +92,25 @@ impl Interner {
         if let Some(&symbol) = self.lookup.get(text) {
             return symbol;
         }
+        let text: Rc<str> = Rc::from(text);
         let symbol = Symbol(self.strings.len() as u32);
-        self.strings.push(text.to_string());
-        self.lookup.insert(text.to_string(), symbol);
+        self.strings.push(Rc::clone(&text));
+        self.lookup.insert(text, symbol);
         symbol
     }
 
     /// The text `symbol` stands for.
+    ///
+    /// Returns an [`Rc`] rather than a borrow so that the caller does not hold
+    /// the interner. Cloning is a refcount bump; the text is not copied.
     ///
     /// # Panics
     ///
     /// Panics if `symbol`'s index is out of bounds. A symbol from a different
     /// interner is not reliably caught that way: if its index happens to be in
     /// range, the wrong text is returned silently.
-    pub fn get(&self, symbol: Symbol) -> &str {
-        &self.strings[symbol.0 as usize]
+    pub fn get(&self, symbol: Symbol) -> Rc<str> {
+        Rc::clone(&self.strings[symbol.0 as usize])
     }
 }
 
@@ -135,7 +144,7 @@ mod tests {
     fn keyword_constants_match_their_spellings() {
         let interner = Interner::new();
         for (symbol, spelling) in KEYWORD_SYMBOLS.into_iter().zip(KEYWORDS) {
-            assert_eq!(interner.get(symbol), spelling);
+            assert_eq!(&*interner.get(symbol), spelling);
         }
     }
 
@@ -176,6 +185,6 @@ mod tests {
     fn symbols_round_trip_through_the_interner() {
         let mut interner = Interner::new();
         let symbol = interner.intern("\u{3042}\u{3044}");
-        assert_eq!(interner.get(symbol), "\u{3042}\u{3044}");
+        assert_eq!(&*interner.get(symbol), "\u{3042}\u{3044}");
     }
 }
