@@ -9,7 +9,7 @@
 //!
 //! The price is that inserting one byte into an early file shifts every position
 //! in every later file. `rustc` pays for that with stable file identifiers and
-//! relative offsets in its incremental fingerprints
+//! relative offsets in its incremental fingerprints.
 //!
 //! Here a `BytePos` is an offset into one file. Every query is keyed by a
 //! `FileId`, so the file is always known from context and the global space buys
@@ -39,7 +39,7 @@ impl Add<u32> for BytePos {
 /// A half-open byte range `[lo, hi)` within one source file.
 ///
 /// Attached to everything the compiler can complain about. Diagnostics are only
-/// as good as the spans reaching them, o nearly every syntactic and semantic
+/// as good as the spans reaching them, so nearly every syntactic and semantic
 /// item carries one.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Span {
@@ -96,14 +96,14 @@ impl Span {
         }
     }
 
-    /// The next this span covers within `text`.
+    /// The text this span covers within `text`.
     ///
     /// `rustc` reaches this through `SourceMap::span_to_snippet`, because there
     /// the file has to be located first.
     ///
     /// # Panics
     ///
-    /// Panics if the span it out of bounds for `text`, or if either end falls
+    /// Panics if the span is out of bounds for `text`, or if either end falls
     /// inside a multi-byte character.
     pub fn slice(self, text: &str) -> &str {
         &text[self.lo.0 as usize..self.hi.0 as usize]

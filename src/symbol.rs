@@ -53,7 +53,7 @@ impl Symbol {
     /// Whether this symbol is one of the language's keywords.
     ///
     /// A range check, because keywords are interned first and nothing else can
-    /// lang below them.
+    /// land below them.
     pub fn is_keyword(self) -> bool {
         (self.0 as usize) < KEYWORDS.len()
     }
