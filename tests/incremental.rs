@@ -241,3 +241,36 @@ fn identical_rewrite_stops_at_the_first_query() {
     let events = db.take_events();
     assert_eq!(executed_queries(&events), query_set(["token_count(0)"]));
 }
+
+// ---- The interner is not part of the query graph ----
+
+/// Interning is idempotent within a database, which is what lets symbol
+/// equality stand in for string equality everywhere else.
+#[test]
+fn interning_is_stable_within_a_database() {
+    let db = Db::new();
+
+    let first = db.intern("main");
+    let second = db.intern("main");
+    assert_eq!(first, second);
+    assert_eq!(&*db.symbol_text(first), "main");
+}
+
+/// Interning must not attach a dependency edge to whichever query is running,
+/// or adding one unrelated identifier would invalidate unrelated memos.
+#[test]
+fn interning_does_not_disturb_memos() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, FOUR.to_string());
+
+    db.weight(f);
+    db.take_events();
+
+    db.intern("something_new");
+
+    assert_eq!(db.weight(f), 4);
+
+    let events = db.take_events();
+    assert!(executed_queries(&events).is_empty());
+}
