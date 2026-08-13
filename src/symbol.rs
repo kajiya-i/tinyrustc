@@ -97,7 +97,9 @@ impl Interner {
     ///
     /// # Panics
     ///
-    /// Panics if `symbol` came from a different interner.
+    /// Panics if `symbol`'s index is out of bounds. A symbol from a different
+    /// interner is not reliably caught that way: if its index happens to be in
+    /// range, the wrong text is returned silently.
     pub fn get(&self, symbol: Symbol) -> &str {
         &self.strings[symbol.0 as usize]
     }
