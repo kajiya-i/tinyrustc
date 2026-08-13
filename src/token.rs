@@ -87,7 +87,7 @@ pub enum TokenKind {
 
 /// Something the lexer could not make sense of.
 ///
-/// Collected rather than repoted, because this layer has no diagnostic
+/// Collected rather than reported, because this layer has no diagnostic
 /// machinery yet and lexing must not stop at the first problem: a parser needs
 /// the rest of the tokens to recover.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
