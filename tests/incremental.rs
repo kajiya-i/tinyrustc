@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use tinyrustc::db::{Db, Event, FileId};
+use tinyrustc::token::TokenKind;
 
 /// Two whitespace-separated tokens: trivial, weight 0.
 const TWO: &str = "a b";
@@ -273,4 +274,89 @@ fn interning_does_not_disturb_memos() {
 
     let events = db.take_events();
     assert!(executed_queries(&events).is_empty());
+}
+
+// ---- Lexing through the query system ----
+
+/// A short program used for the lexing tests. Seven tokens including `Eof`.
+const PROGRAM: &str = "fn main() {}";
+
+#[test]
+fn lexing_is_memoized() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, PROGRAM.to_string());
+
+    let first = db.lexed(f);
+    assert_eq!(db.take_events(), vec![executed("lexed(0)")]);
+
+    let second = db.lexed(f);
+    assert_eq!(db.take_events(), vec![reused("lexed(0)")]);
+    assert_eq!(first, second);
+}
+
+/// Names interned while lexing land in the database's interner, so a symbol
+/// carried by a token resolves through it.
+#[test]
+fn lexing_interns_into_the_database() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, "answer".to_string());
+
+    let lexed = db.lexed(f);
+    match lexed.tokens[0].kind {
+        TokenKind::Ident(symbol) => assert_eq!(&*db.symbol_text(symbol), "answer"),
+        other => panic!("expected an identifier, got {other:?}"),
+    }
+}
+
+/// Errors travel with the tokens rather than stopping lexing, because a parser
+/// needs the rest of the input to recover.
+#[test]
+fn errors_arrive_alongside_the_tokens() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, "a # b".to_string());
+
+    let lexed = db.lexed(f);
+    assert_eq!(lexed.errors.len(), 1);
+    // Ident, Ident, Eof - the unknown character is dropped, not fatal.
+    assert_eq!(lexed.tokens.len(), 3);
+}
+
+/// Pins the cost of putting absolute positions in a query result: one leading
+/// space shifts every span, so the value differs and backdating has nothing to
+/// backdate.
+#[test]
+fn a_leading_space_changes_every_span() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, PROGRAM.to_string());
+    let before = db.lexed(f);
+
+    db.set_source_text(f, format!(" {PROGRAM}"));
+    let after = db.lexed(f);
+
+    assert_eq!(before.tokens.len(), after.tokens.len());
+    assert_ne!(before, after);
+}
+
+/// Rewriting a file with identical bytes re-lexes it, but the value is equal so
+/// the change revision is backdated.
+///
+/// Not observable from outside yet, because nothing reads `lexed`. The parser
+/// will make it visible.
+#[test]
+fn identical_rewrite_relexes_but_backdates() {
+    let mut db = Db::new();
+    let f = FileId(0);
+    db.set_source_text(f, PROGRAM.to_string());
+    let before = db.lexed(f);
+    db.take_events();
+
+    db.set_source_text(f, PROGRAM.to_string());
+    let after = db.lexed(f);
+
+    assert_eq!(db.take_events(), vec![executed("lexed(0)")]);
+    assert_eq!(before, after);
 }
