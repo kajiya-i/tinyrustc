@@ -61,9 +61,10 @@
 //!
 //! - Backdating compares values with `==`, so it only helps for cheaply
 //!   comparable results. Large trees will want a fingerprint instead.
-//! - Returning a memoized value clones it. Fine for counts and token lists;
-//!   larger results will want to be handed back behind an `Rc` or an arena
-//!   reference, as `rustc` does.
+//! - Returning a memoized value clones it. Fine for a count or a flag, but not
+//!   for anything the size of a token list, which is why those are memoized
+//!   behind an `Rc`. `rustc` hands back arena-allocated `&'tcx` references
+//!   instead, which is what removes the choice entirely.
 //! - Cycles abort the process rather than producing a diagnostic.
 //! - Every query still needs its own memo table, `DepKey` variant, and
 //!   `changed_at` arm by hand. `salsa`'s attribute macros exist to generate
@@ -75,6 +76,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::symbol::{Interner, Symbol};
+use crate::token::{Lexed, lex};
 
 /// A monotonically increasing logical clock, bumped on every write to an input.
 ///
@@ -107,6 +109,7 @@ enum DepKey {
     TokenCount(FileId),
     IsTrivial(FileId),
     Weight(FileId),
+    Lexed(FileId),
 }
 
 impl fmt::Display for DepKey {
@@ -116,6 +119,7 @@ impl fmt::Display for DepKey {
             DepKey::TokenCount(file) => write!(f, "token_count({})", file.0),
             DepKey::IsTrivial(file) => write!(f, "is_trivial({})", file.0),
             DepKey::Weight(file) => write!(f, "weight({})", file.0),
+            DepKey::Lexed(file) => write!(f, "lexed({})", file.0),
         }
     }
 }
@@ -169,6 +173,7 @@ pub struct Db {
     token_count_memos: RefCell<HashMap<FileId, Memo<usize>>>,
     is_trivial_memos: RefCell<HashMap<FileId, Memo<bool>>>,
     weight_memos: RefCell<HashMap<FileId, Memo<usize>>>,
+    lexed_memos: RefCell<HashMap<FileId, Memo<Rc<Lexed>>>>,
 
     // Outside the query graph; see the module documentation.
     interner: RefCell<Interner>,
@@ -186,6 +191,7 @@ impl Db {
             token_count_memos: RefCell::new(HashMap::new()),
             is_trivial_memos: RefCell::new(HashMap::new()),
             weight_memos: RefCell::new(HashMap::new()),
+            lexed_memos: RefCell::new(HashMap::new()),
             interner: RefCell::new(Interner::new()),
             stack: RefCell::new(Vec::new()),
             events: RefCell::new(Vec::new()),
@@ -323,6 +329,14 @@ impl Db {
                     .expect("memo absent after its query ran")
                     .changed_at
             }
+            DepKey::Lexed(file) => {
+                self.lexed(file);
+                self.lexed_memos
+                    .borrow()
+                    .get(&file)
+                    .expect("memo absent after its query ran")
+                    .changed_at
+            }
         }
     }
 
@@ -433,6 +447,32 @@ impl Db {
             // about.
             let count = self.token_count(file);
             if self.is_trivial(file) { 0 } else { count }
+        })
+    }
+
+    /// Lexes `file` into spanned tokens, interning every name it contains.
+    ///
+    /// Behind an [`Rc`] because `memoized` clones on every hit and a token
+    /// list is too large to copy. Equality still compares the contents, so
+    /// backdating works.
+    ///
+    /// # Spans and incrementality
+    ///
+    /// Tokens carry absolute positions, so inserting one byte near the start of
+    /// a file changes every span after it and the value genuinely differs.
+    /// Backdating cannot help. That is harmless here, because any edit to the
+    /// file invalidates this query regardless, but it is a trap further along: a
+    /// query meant to survive edits elsewhere must not hold absolute positions.
+    /// `rustc` contains the same problem by making a `HirId` relative to its
+    /// owning item, so editing one body does not renumber another.
+    pub fn lexed(&self, file: FileId) -> Rc<Lexed> {
+        self.memoized(DepKey::Lexed(file), &self.lexed_memos, file, || {
+            let text = self.source_text(file);
+            // The interner borrow is held for the whole call. Safe only because
+            // `lex` does not know about `Db` and so cannot re-enter this
+            // `RefCell`. Passing the database into the lexer would panic here.
+            let mut interner = self.interner.borrow_mut();
+            Rc::new(lex(text, &mut interner))
         })
     }
 

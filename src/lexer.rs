@@ -13,9 +13,10 @@
 //!   requires an interner, which belongs to the layer above.
 //! - **Compound operators are not glued.** `==` lexes as two [`RawTokenKind::Eq`]
 //!   tokens and `->` as [`RawTokenKind::Minus`] followed by
-//!   [`RawTokenKind::Gt`]. Joining them is the parser's job, because whether
-//!   `>>` closes two generic parameters or shifts right is not a lexical
-//!   question.
+//!   [`RawTokenKind::Gt`]. Joining them belongs to the layer above, which is
+//!   where trivia is dropped and adjacency is therefore known. The parser then
+//!   splits back where it must, because whether `>>` closes two generic
+//!   parameters or shifts right is not a lexical question.
 //! - **Whitespace and comments are tokens.** Nothing is silently dropped, so the
 //!   lengths of the tokens produced for an input sum exactly to that input's
 //!   length. That invariant is what makes byte offsets computed by the layer

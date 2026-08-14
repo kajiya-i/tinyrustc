@@ -102,11 +102,23 @@ pub enum LexErrorKind {
     UnterminatedBlockComment,
 }
 
+/// Everything lexing one file produced.
+///
+/// Tokens and errors travel together because splitting them into two queries
+/// would lex the file twice. `rustc` instead emits diagnostics as a side effect
+/// and replays them from its incremental cache; `salsa` offers accumulators.
+/// Either is a larger design than the parser needs yet.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Lexed {
+    pub tokens: Vec<Token>,
+    pub errors: Vec<LexError>,
+}
+
 /// Lexes `text`, interning every name it finds.
 ///
-/// Always returns a token list ending in [`TokenKind::Eof`], whatever errors
-/// were found alongside.
-pub fn lex(text: &str, interner: &mut Interner) -> (Vec<Token>, Vec<LexError>) {
+/// [`Lexed::tokens`] always ends in [`TokenKind::Eof`], whatever errors were
+/// found alongside.
+pub fn lex(text: &str, interner: &mut Interner) -> Lexed {
     // Absolute positions come from accumulating raw token lengths. Sound only
     // because the raw layer tiles its input; see `crate::lexer`.
     let mut raw: Vec<(RawTokenKind, Span)> = Vec::new();
@@ -201,7 +213,7 @@ pub fn lex(text: &str, interner: &mut Interner) -> (Vec<Token>, Vec<LexError>) {
         kind: TokenKind::Eof,
         span: Span::new(pos, pos),
     });
-    (tokens, errors)
+    Lexed { tokens, errors }
 }
 
 #[cfg(test)]
@@ -213,8 +225,9 @@ mod tests {
     /// stay readable.
     fn render(text: &str) -> Vec<String> {
         let mut interner = Interner::new();
-        let (tokens, _) = lex(text, &mut interner);
-        tokens
+        let lexed = lex(text, &mut interner);
+        lexed
+            .tokens
             .iter()
             .map(|token| {
                 let body = match token.kind {
@@ -230,7 +243,7 @@ mod tests {
 
     fn errors(text: &str) -> Vec<LexError> {
         let mut interner = Interner::new();
-        lex(text, &mut interner).1
+        lex(text, &mut interner).errors
     }
 
     #[test]
@@ -324,7 +337,7 @@ mod tests {
     #[test]
     fn keywords_arrive_as_identifiers_carrying_keyword_symbols() {
         let mut interner = Interner::new();
-        let (tokens, _) = lex("fn while notakeyword", &mut interner);
+        let tokens = lex("fn while notakeyword", &mut interner).tokens;
 
         assert_eq!(tokens[0].kind, TokenKind::Ident(kw::FN));
         assert_eq!(tokens[1].kind, TokenKind::Ident(kw::WHILE));
@@ -337,7 +350,7 @@ mod tests {
     #[test]
     fn the_same_name_interns_to_the_same_symbol() {
         let mut interner = Interner::new();
-        let (tokens, _) = lex("x + x", &mut interner);
+        let tokens = lex("x + x", &mut interner).tokens;
         assert_eq!(tokens[0].kind, tokens[2].kind);
     }
 
@@ -347,10 +360,14 @@ mod tests {
     fn spans_slice_back_to_their_source() {
         let text = "fn take(r: &'a mut u32) -> u32 { 1_000 }";
         let mut interner = Interner::new();
-        let (tokens, found) = lex(text, &mut interner);
-        assert!(found.is_empty(), "unexpected errors: {found:?}");
+        let lexed = lex(text, &mut interner);
+        assert!(
+            lexed.errors.is_empty(),
+            "unexpected errors: {:?}",
+            lexed.errors,
+        );
 
-        for token in &tokens {
+        for token in &lexed.tokens {
             match token.kind {
                 TokenKind::Ident(symbol) | TokenKind::Int(symbol) => {
                     assert_eq!(token.span.slice(text), &*interner.get(symbol));
